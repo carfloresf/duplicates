@@ -52,7 +52,10 @@ func scanAndHashFile(path string, f os.FileInfo, progress *Progress) {
 				log.Errorln(err)
 			}
 			var hash = fmt.Sprintf("%x", md5.Sum(nil))
-			file.Close()
+			err = file.Close()
+			if err != nil {
+				log.Errorln(err)
+			}
 			duplicates.Lock()
 			duplicates.m[hash] = append(duplicates.m[hash], path)
 			duplicates.Unlock()
