@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/md5"
 	"flag"
 	"fmt"
@@ -40,27 +41,49 @@ var (
 )
 
 func scanAndHashFile(path string, f os.FileInfo, progress *Progress) {
-	if !f.IsDir() && f.Size() > minSize && (filenameMatch == "*" || filenameRegex.MatchString(f.Name())) {
-		atomic.AddInt64(&fileCount, 1)
-		file, err := os.Open(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
-		} else {
-			md5 := md5.New()
-			_, err := io.Copy(md5, file)
-			if err != nil {
-				log.Errorln(err)
-			}
-			var hash = fmt.Sprintf("%x", md5.Sum(nil))
-			err = file.Close()
-			if err != nil {
-				log.Errorln(err)
-			}
-			duplicates.Lock()
-			duplicates.m[hash] = append(duplicates.m[hash], path)
-			duplicates.Unlock()
-			progress.increment()
-		}
+	// Early return if basic conditions are not met
+	if f.IsDir() || f.Size() <= minSize || (filenameMatch != "*" && !filenameRegex.MatchString(f.Name())) {
+		return
+	}
+
+	// Increment file count atomically
+	atomic.AddInt64(&fileCount, 1)
+
+	// Open the file
+	file, err := os.Open(path)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"path":  path,
+			"error": err,
+		}).Error("Failed to open file")
+		return
+	}
+	defer file.Close()
+
+	// Create a buffered reader for better performance
+	bufReader := bufio.NewReaderSize(file, 1024*1024) // 1MB buffer
+
+	// Calculate MD5 hash
+	md5Hash := md5.New()
+	if _, err := io.Copy(md5Hash, bufReader); err != nil {
+		log.WithFields(log.Fields{
+			"path":  path,
+			"error": err,
+		}).Error("Failed to calculate hash")
+		return
+	}
+
+	// Generate hash string
+	hash := fmt.Sprintf("%x", md5Hash.Sum(nil))
+
+	// Update duplicates map with proper locking
+	duplicates.Lock()
+	duplicates.m[hash] = append(duplicates.m[hash], path)
+	duplicates.Unlock()
+
+	// Update progress
+	if progress != nil {
+		progress.increment()
 	}
 }
 
