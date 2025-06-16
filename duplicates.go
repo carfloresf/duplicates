@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/md5"
 	"flag"
 	"fmt"
@@ -87,38 +88,113 @@ func scanAndHashFile(path string, f os.FileInfo, progress *Progress) {
 	}
 }
 
-func worker(workerID int, jobs <-chan *WalkedFile, results chan<- int, progress *Progress) {
-	for file := range jobs {
-		fmt.Println("hashing ", file.path, " on worker ", workerID)
-		scanAndHashFile(file.path, file.file, progress)
-		results <- 0
+type workerStats struct {
+	processedFiles int64
+	totalBytes    int64
+	errors        int64
+}
+
+func worker(ctx context.Context, workerID int, jobs <-chan *WalkedFile, results chan<- error, progress *Progress) {
+	stats := &workerStats{}
+	defer func() {
+		log.WithFields(log.Fields{
+			"workerID":       workerID,
+			"processedFiles": stats.processedFiles,
+			"totalBytes":    stats.totalBytes,
+			"errors":        stats.errors,
+		}).Debug("Worker finished")
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			results <- ctx.Err()
+			return
+		case file, ok := <-jobs:
+			if !ok {
+				// Channel closed, worker can exit
+				results <- nil
+				return
+			}
+
+			// Process the file
+			if file == nil || file.file == nil {
+				atomic.AddInt64(&stats.errors, 1)
+				results <- fmt.Errorf("received invalid file data")
+				continue
+			}
+
+			// Log file processing at debug level
+			log.WithFields(log.Fields{
+				"workerID": workerID,
+				"file":     file.path,
+				"size":     file.file.Size(),
+			}).Debug("Processing file")
+
+			// Process the file
+			scanAndHashFile(file.path, file.file, progress)
+
+			// Update statistics
+			atomic.AddInt64(&stats.processedFiles, 1)
+			atomic.AddInt64(&stats.totalBytes, file.file.Size())
+
+			// Signal completion
+			results <- nil
+		}
 	}
 }
 
-func computeHashes() {
-	walkProgress := creatProgress("Scanning %d files ...", &noStats)
-	jobs := make(chan *WalkedFile, visitCount)
-	results := make(chan int, visitCount)
+func computeHashes() error {
+	// Create a context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if singleThread {
-		fmt.Println("Single Thread Mode")
-		go worker(1, jobs, results, walkProgress)
-	} else {
-		for w := 1; w <= runtime.NumCPU(); w++ {
-			go worker(w, jobs, results, walkProgress)
+	// Initialize progress bar
+	walkProgress := creatProgress("Scanning %d files ...", &noStats)
+	defer walkProgress.delete()
+
+	// Create buffered channels for jobs and results
+	jobs := make(chan *WalkedFile, visitCount)
+	results := make(chan error, visitCount)
+
+	// Calculate number of workers
+	numWorkers := 1
+	if !singleThread {
+		numWorkers = runtime.NumCPU()
+	}
+
+	// Start workers
+	log.WithField("workers", numWorkers).Info("Starting workers")
+	for w := 1; w <= numWorkers; w++ {
+		go worker(ctx, w, jobs, results, walkProgress)
+	}
+
+	// Send jobs to workers
+	go func() {
+		defer close(jobs)
+		for _, file := range walkFiles {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- file:
+			}
+		}
+	}()
+
+	// Collect results and handle errors
+	var firstErr error
+	for i := 0; i < len(walkFiles); i++ {
+		if err := <-results; err != nil {
+			if firstErr == nil {
+				firstErr = err
+				// Cancel context to stop other workers
+				cancel()
+			}
+			log.WithError(err).Error("Error processing file")
 		}
 	}
 
-	for _, file := range walkFiles {
-		jobs <- file
-	}
-
-	close(jobs)
-
-	for range walkFiles {
-		<-results
-	}
-	walkProgress.delete()
+	return firstErr
 }
 
 func visitFile(path string, f os.FileInfo, err error) error {
